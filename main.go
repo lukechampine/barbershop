@@ -31,6 +31,7 @@ func main() {
 	versionCmd := flagg.New("version", versionUsage)
 	idCmd := flagg.New("id", idUsage)
 	idCmd.BoolVar(&bb.silent, "silent", false, "don't play audio during identification")
+	track := idCmd.Int("track", 0, "identify the n-th track in the playlist")
 
 	cmd := flagg.Parse(flagg.Tree{
 		Cmd: rootCmd,
@@ -53,12 +54,14 @@ func main() {
 		uri, isAlbum, err := resolveURI(args[0])
 		if err != nil {
 			log.Fatalln("Error:", err)
+		} else if !isAlbum && *track != 0 {
+			log.Fatalln("Error: --track flag is only valid for albums")
 		}
 		var m tea.Model
-		if isAlbum {
+		if isAlbum && *track == 0 {
 			m = newAlbumModel(uri)
 		} else {
-			m = newSingleModel(uri)
+			m = newSingleModel(uri, *track)
 		}
 		p := tea.NewProgram(m)
 		if _, err := p.Run(); err != nil {

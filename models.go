@@ -305,20 +305,25 @@ func (m *identifyAlbumModel) View() string {
 
 type identifySingleModel struct {
 	uri     mediaURI
+	track   int
 	spinner spinnerModel
 	m       *identifyTrackModel
 	links   map[string]string
 	err     error
 }
 
-func newSingleModel(uri mediaURI) *identifySingleModel {
+func newSingleModel(uri mediaURI, track int) *identifySingleModel {
 	return &identifySingleModel{
 		uri:     uri,
+		track:   track,
 		spinner: newSpinner(spinner.Moon),
 	}
 }
 
 func (m *identifySingleModel) Init() tea.Cmd {
+	if m.track > 0 {
+		return tea.Batch(m.spinner.tick, cmdFetchPlaylistTrack(m.uri, m.track))
+	}
 	return tea.Batch(m.spinner.tick, cmdFetchTrack(m.uri))
 }
 

@@ -218,3 +218,17 @@ func cmdFetchPlaylist(uri mediaURI) tea.Cmd {
 		}
 	}
 }
+
+func cmdFetchPlaylistTrack(uri mediaURI, track int) tea.Cmd {
+	return func() tea.Msg {
+		r := cmdFetchPlaylist(uri)()
+		pl, ok := r.(msgFetchedPlaylist)
+		if !ok {
+			return r
+		}
+		if track < 1 || track > len(pl.pl.Entries) {
+			return msgError{errors.New("invalid track number")}
+		}
+		return cmdFetchTrack(pl.pl.Entries[track-1].URI)()
+	}
+}
