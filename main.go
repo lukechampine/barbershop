@@ -31,7 +31,7 @@ func main() {
 	versionCmd := flagg.New("version", versionUsage)
 	idCmd := flagg.New("id", idUsage)
 	idCmd.BoolVar(&bb.silent, "silent", false, "don't play audio during identification")
-	track := idCmd.Int("track", 0, "identify the n-th track in the playlist")
+	track := idCmd.Int("track", 0, "identify the n-th track in the album")
 
 	cmd := flagg.Parse(flagg.Tree{
 		Cmd: rootCmd,

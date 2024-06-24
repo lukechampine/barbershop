@@ -101,7 +101,7 @@ again:
 	if len(respData.Matches) == 0 {
 		return Result{Found: false}, nil
 	}
-	album, year := "Unknown", "Unknown year"
+	album, year := "", ""
 	for _, section := range respData.Track.Sections {
 		for _, meta := range section.Metadata {
 			switch meta.Title {

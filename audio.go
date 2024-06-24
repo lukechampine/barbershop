@@ -46,6 +46,19 @@ var bb struct {
 	v      *effects.Volume
 	silent bool
 	mu     sync.Mutex
+
+	offset  time.Duration
+	ratio   float64
+	stateMu sync.Mutex
+}
+
+func boomboxState() (time.Duration, float64) {
+	bb.stateMu.Lock()
+	defer bb.stateMu.Unlock()
+	if bb.r == nil {
+		return 0, 1
+	}
+	return bb.offset, bb.r.Ratio()
 }
 
 func boomboxFadeIn(path string) error {
@@ -66,27 +79,41 @@ func boomboxFadeIn(path string) error {
 			Base:     2,
 			Volume:   0,
 		}
-		if err := speaker.Init(format.SampleRate, format.SampleRate.N(10*time.Millisecond)); err != nil {
+		if err := speaker.Init(format.SampleRate, format.SampleRate.N(100*time.Millisecond)); err != nil {
 			return err
 		}
 		speaker.Play(oldv)
 	}
-	bb.r = beep.ResampleRatio(4, 1.0, stream)
-	bb.v = &effects.Volume{
-		Streamer: bb.r,
+	newr := beep.ResampleRatio(4, 1.0, stream)
+	newv := &effects.Volume{
+		Streamer: newr,
 		Base:     2,
 		Volume:   -5,
 	}
-	speaker.Play(bb.v)
+	speaker.Play(beep.StreamerFunc(func(samples [][2]float64) (int, bool) {
+		n, ok := newv.Stream(samples)
+		bb.stateMu.Lock()
+		bb.offset += format.SampleRate.D(n)
+		bb.stateMu.Unlock()
+		return n, ok
+	}))
 	for oldv.Volume > -5 {
 		speaker.Lock()
 		oldv.Volume -= 0.1
-		bb.v.Volume += 0.1
+		newv.Volume += 0.1
 		speaker.Unlock()
 		time.Sleep(50 * time.Millisecond)
 	}
 	speaker.Clear()
-	speaker.Play(bb.v)
+	speaker.Play(beep.StreamerFunc(func(samples [][2]float64) (int, bool) {
+		n, ok := newv.Stream(samples)
+		bb.stateMu.Lock()
+		bb.offset += format.SampleRate.D(n)
+		bb.stateMu.Unlock()
+		return n, ok
+	}))
+	bb.r = newr
+	bb.v = newv
 	return nil
 }
 
@@ -102,6 +129,7 @@ func boomboxFadeOut() {
 		speaker.Unlock()
 		time.Sleep(50 * time.Millisecond)
 	}
+	bb.v.Silent = true
 	speaker.Clear()
 }
 
@@ -113,33 +141,102 @@ func boomboxChangeSpeed(speedup float64) {
 	defer bb.mu.Unlock()
 	for math.Abs(speedup-bb.r.Ratio()) > 0.01 {
 		speaker.Lock()
-		bb.r.SetRatio(bb.r.Ratio() + (speedup-bb.r.Ratio())/10)
+		r := bb.r.Ratio() + (speedup-bb.r.Ratio())/10
+		bb.r.SetRatio(r)
 		speaker.Unlock()
+		bb.stateMu.Lock()
+		bb.ratio = r
+		bb.stateMu.Unlock()
 		time.Sleep(100 * time.Millisecond)
 	}
+	speaker.Lock()
+	bb.r.SetRatio(speedup)
+	speaker.Unlock()
+	bb.stateMu.Lock()
+	bb.ratio = speedup
+	bb.stateMu.Unlock()
+}
+
+type identifyParams struct {
+	ratio  float64
+	offset time.Duration
 }
 
 type identifyResult struct {
-	res   shazam.Result
-	ratio float64
-	skew  float64
+	params identifyParams
+	res    shazam.Result
+	skew   float64
 }
 
-func identifyPath(path string, speedup float64, offset time.Duration) (identifyResult, error) {
+func identifyPath(path string, params identifyParams) (identifyResult, error) {
 	stream, format, err := openStreamer(path)
 	if err != nil {
 		return identifyResult{}, err
 	}
-	s := beep.ResampleRatio(6, speedup*float64(format.SampleRate)/16000, stream)
+	s := beep.ResampleRatio(6, params.ratio*float64(format.SampleRate)/16000, stream)
 	format.SampleRate = 16000
-	sample := shazam.CollectSample(s, format, offset, 12*time.Second)
+	sample := shazam.CollectSample(s, format, params.offset, 12*time.Second)
 	res, err := shazam.Identify(shazam.ComputeSignature(int(format.SampleRate), sample))
 	if err != nil {
 		return identifyResult{}, err
 	}
 	return identifyResult{
-		res:   res,
-		ratio: speedup,
-		skew:  math.Abs(res.Skew),
+		params: params,
+		res:    res,
+		skew:   math.Abs(res.Skew),
 	}, nil
+}
+
+type trackIdentifier struct {
+	path    string
+	params  []identifyParams
+	results []identifyResult
+	sample  *identifyResult
+}
+
+func newTrackIdentifier(path string) *trackIdentifier {
+	var params []identifyParams
+	for _, speedup := range []float64{1.20, 1.30, 1.10, 1.25, 1.15, 1.40, 1.50, 0.90, 0.80, 1.60, 1.70, 1.80, 1.90, 2.00, 1.00} {
+		for _, offset := range []time.Duration{24 * time.Second, 48 * time.Second, 72 * time.Second} {
+			params = append(params, identifyParams{speedup, offset})
+		}
+	}
+	return &trackIdentifier{
+		path:   path,
+		params: params,
+	}
+}
+
+func (id *trackIdentifier) currentParams() identifyParams {
+	return id.params[0]
+}
+
+func (id *trackIdentifier) handleResult(r identifyResult) (nextParams *identifyParams) {
+	if !r.res.Found {
+		// skip to the next speedup without trying other offsets
+		for len(id.params) > 1 && id.params[0].ratio == r.params.ratio {
+			id.params = id.params[1:]
+		}
+	} else {
+		// have we found a match?
+		id.results = append(id.results, r)
+		hits := 0
+		for _, res := range id.results {
+			if res.res.Artist == r.res.Artist && res.res.Title == r.res.Title {
+				hits++
+			}
+		}
+		if hits == 3 {
+			id.sample = &r
+			return nil
+		}
+	}
+
+	// have we exhausted all params?
+	if len(id.params) == 1 {
+		return nil
+	}
+	id.params = id.params[1:]
+	p := id.params[0]
+	return &p
 }

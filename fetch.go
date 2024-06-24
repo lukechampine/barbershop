@@ -21,6 +21,9 @@ func execCmd(prog string, args ...string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return nil, errors.New(prog + " not found")
+		}
 		return nil, errors.New(stderr.String())
 	}
 	return stdout.Bytes(), nil

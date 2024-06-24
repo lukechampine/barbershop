@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -21,8 +23,7 @@ type (
 		pl playlist
 	}
 	msgIdentifyResult struct {
-		ir    identifyResult
-		model *identifyTrackModel // scuffed ID system
+		ir identifyResult
 	}
 	msgLinks struct {
 		links map[string]string
@@ -54,42 +55,22 @@ func newSpinner(s spinner.Spinner) spinnerModel {
 }
 
 type identifyTrackModel struct {
-	// constant
-	uri   mediaURI
-	title string
-
-	// variable
+	uri     mediaURI
+	title   string
 	status  string
-	path    string
-	params  []identifyParams
-	results []identifyResult
-	sample  identifyResult
-
-	// submodels
+	id      *trackIdentifier
 	spinner spinnerModel
 }
 
-type identifyParams struct {
-	speedup float64
-	offset  time.Duration
-}
-
 func newIdentifyTrackModel(uri mediaURI, title string) *identifyTrackModel {
-	var params []identifyParams
-	for _, speedup := range []float64{1.20, 1.30, 1.10, 1.25, 1.15, 1.40, 1.50, 0.90, 0.80, 1.60, 1.70, 1.80, 1.90, 2.00, 1.00} {
-		for _, offset := range []time.Duration{24 * time.Second, 36 * time.Second, 60 * time.Second} {
-			params = append(params, identifyParams{speedup, offset})
-		}
-	}
-
-	cassette := spinner.Line
-	cassette.FPS = time.Second / 6
 	return &identifyTrackModel{
-		uri:     uri,
-		title:   title,
-		status:  "queued",
-		params:  params,
-		spinner: newSpinner(cassette),
+		uri:    uri,
+		title:  title,
+		status: "queued",
+		spinner: newSpinner(spinner.Spinner{
+			Frames: spinner.Line.Frames,
+			FPS:    time.Second / 6,
+		}),
 	}
 }
 
@@ -100,7 +81,7 @@ func (m *identifyTrackModel) init() tea.Cmd {
 
 func (m *identifyTrackModel) cmdStartIdentifying(path string) tea.Cmd {
 	m.status = "identifying"
-	m.path = path
+	m.id = newTrackIdentifier(path)
 	return tea.Sequence(
 		func() tea.Msg {
 			if err := boomboxFadeIn(path); err != nil {
@@ -108,40 +89,33 @@ func (m *identifyTrackModel) cmdStartIdentifying(path string) tea.Cmd {
 			}
 			return nil
 		},
-		m.cmdTryNextParams(),
+		m.cmdTryNextParams(m.id.currentParams()),
 	)
 }
 
 func (m *identifyTrackModel) cmdHandleResult(r identifyResult) tea.Cmd {
-	m.params = m.params[1:]
-
-	if !r.res.Found {
-		// skip to the next speedup
-		for len(m.params) > 0 && m.params[0].speedup == r.ratio {
-			m.params = m.params[1:]
-		}
-	} else {
-		// have we found a match?
-		m.results = append(m.results, r)
-		hits := 0
-		for _, res := range m.results {
-			if res.res.Artist == r.res.Artist && res.res.Title == r.res.Title {
-				hits++
-			}
-		}
-		if hits == 3 {
-			m.status = "done"
-			m.sample = r
-			return nil
-		}
-	}
-
-	// have we exhausted all params?
-	if len(m.params) == 0 {
+	nextParams := m.id.handleResult(r)
+	if nextParams == nil {
 		m.status = "done"
 		return nil
 	}
-	return m.cmdTryNextParams()
+	return m.cmdTryNextParams(*nextParams)
+}
+
+func (m *identifyTrackModel) cmdTryNextParams(p identifyParams) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			boomboxChangeSpeed(p.ratio)
+			return nil
+		},
+		func() tea.Msg {
+			res, err := identifyPath(m.id.path, p)
+			if err != nil {
+				return msgError{err}
+			}
+			return msgIdentifyResult{res}
+		},
+	)
 }
 
 func (m *identifyTrackModel) skip() {
@@ -159,40 +133,23 @@ func (m *identifyTrackModel) render() string {
 		fmt.Fprintf(&sb, "⬇  Fetching%-3v  ⬇", s.View())
 	case "identifying":
 		dots := "?∙∙"
-		if m.params[0].offset == 36*time.Second {
+		p := m.id.currentParams()
+		if p.offset == 36*time.Second {
 			dots = "✔?∙"
-		} else if m.params[0].offset == 60*time.Second {
+		} else if p.offset == 60*time.Second {
 			dots = "✔✔?"
 		}
-		fmt.Fprintf(&sb, "(%v)  Trying %.2fx %v  (%v)", m.spinner.view(), m.params[0].speedup, dots, m.spinner.view())
+		fmt.Fprintf(&sb, "(%v)  Trying %.2fx %v  (%v)", m.spinner.view(), p.ratio, dots, m.spinner.view())
 	case "skipped":
 		fmt.Fprintf(&sb, "<skipped>")
 	case "done":
-		if m.sample.res.Found {
-			fmt.Fprintf(&sb, "✔  %v - %v (%.0f%% match @ %.2fx speed)", m.sample.res.Artist, m.sample.res.Title, 100-m.sample.skew*100, m.sample.ratio)
+		if s := m.id.sample; s != nil {
+			fmt.Fprintf(&sb, "✔  %v - %v (%.0f%% match @ %.2fx speed)", s.res.Artist, s.res.Title, 100*(1-s.skew), s.params.ratio)
 		} else {
 			fmt.Fprintf(&sb, "X  Match not found :/")
 		}
 	}
 	return sb.String()
-}
-
-func (m *identifyTrackModel) cmdTryNextParams() tea.Cmd {
-	speedup, offset := m.params[0].speedup, m.params[0].offset
-	path := m.path
-	return tea.Batch(
-		func() tea.Msg {
-			boomboxChangeSpeed(speedup)
-			return nil
-		},
-		func() tea.Msg {
-			res, err := identifyPath(path, speedup, offset)
-			if err != nil {
-				return msgError{err}
-			}
-			return msgIdentifyResult{res, m}
-		},
-	)
 }
 
 type identifyAlbumModel struct {
@@ -270,7 +227,7 @@ func (m *identifyAlbumModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.tracks[m.trackIndex].cmdStartIdentifying(msg.path))
 
 	case msgIdentifyResult:
-		if m.trackIndex >= len(m.tracks) || msg.model != m.tracks[m.trackIndex] {
+		if m.trackIndex >= len(m.tracks) || msg.ir.params != m.tracks[m.trackIndex].id.currentParams() {
 			break
 		}
 		cmds = append(cmds, m.tracks[m.trackIndex].cmdHandleResult(msg.ir))
@@ -303,28 +260,153 @@ func (m *identifyAlbumModel) View() string {
 	return sb.String()
 }
 
-type identifySingleModel struct {
-	uri     mediaURI
-	track   int
-	spinner spinnerModel
-	m       *identifyTrackModel
-	links   map[string]string
-	err     error
+type cassetteModel struct {
+	speedup float64
+	offset  time.Duration
+	gears   spinnerModel
+	noise   spinnerModel
 }
 
-func newSingleModel(uri mediaURI, track int) *identifySingleModel {
-	return &identifySingleModel{
-		uri:     uri,
-		track:   track,
-		spinner: newSpinner(spinner.Moon),
+func newCassetteModel() *cassetteModel {
+	cycle := func(a string) (frames []string) {
+		for i := 0; i < runewidth.StringWidth(a); i++ {
+			frames = append(frames, runewidth.Truncate(runewidth.TruncateLeft(a, i, "")+runewidth.Truncate(a, i, ""), 9, ""))
+		}
+		return
 	}
+	gears := spinner.Spinner{
+		Frames: []string{"╱", "─", "╲", "│"},
+		FPS:    time.Second / 5,
+	}
+	noise := spinner.Spinner{
+		Frames: cycle(`"~-,._.,-~` + `"-,._.,-~` + "¯`·....·´" + "``'-.,_,.-'" + ".·''·..·''·." + ",-*~'`^`'~*-,._.,-*" + "¤ø,..,ø¤º°`°º"),
+		FPS:    time.Second / 20,
+	}
+	return &cassetteModel{
+		speedup: 1,
+		offset:  0,
+		gears:   newSpinner(gears),
+		noise:   newSpinner(noise),
+	}
+}
+
+func (m *cassetteModel) init() tea.Cmd {
+	return tea.Batch(m.gears.tick, m.noise.tick)
+}
+
+func (m *cassetteModel) update(msg tea.Msg) tea.Cmd {
+	return tea.Batch(m.gears.update(msg), m.noise.update(msg))
+}
+
+func (m *cassetteModel) render() string {
+	reverse := func(s string) string {
+		runes := []rune(s)
+		for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+			runes[i], runes[j] = runes[j], runes[i]
+		}
+		return string(runes)
+	}
+	offset, ratio := boomboxState()
+	return fmt.Sprintf(""+
+		"   ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁\n"+
+		" \u2571│............................│\n"+
+		"│ │: %v ???? %v :│\n"+
+		"│ │:   %02v:%02v           %.2fx  :│\n"+
+		"│ │:     ,─.   ▁▁▁▁▁   ,─.    :|\n"+
+		"│ │:    ( %v)) [▁▁▁▁▁] ( %v))   :|\n"+
+		"│v│:     `─`   ' ' '   `─`    :│\n"+
+		"│││:     ,▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁.    :│\n"+
+		"│││.....\u2571::::o::::::o::::╲.....│\n"+
+		"│^│....\u2571:::O::::::::::O:::╲....│\n"+
+		"│\u2571`───\u2571────────────────────`───│\n"+
+		"`.▁▁▁\u2571 \u2571====\u2571 \u2571=\u2571\u2571=\u2571 \u2571====\u2571▁▁▁\u2571\n"+
+		"     `────────────────────'\n",
+		m.noise.view(), reverse(m.noise.view()), int(offset.Minutes()), int((offset % time.Minute).Seconds()), ratio, m.gears.view(), m.gears.view())
+}
+
+type historyModel struct {
+	entries []identifyResult
+}
+
+func newHistoryModel() *historyModel {
+	return &historyModel{}
+}
+
+func (m *historyModel) add(r identifyResult) {
+	m.entries = append(m.entries, r)
+}
+
+func (m *historyModel) render(n int) string {
+	italics := lipgloss.NewStyle().Italic(true).Render
+	var sb strings.Builder
+	for i := max(0, len(m.entries)-n); i < len(m.entries); i++ {
+		r := m.entries[i]
+		if r.res.Found {
+			fmt.Fprintf(&sb, "✔️  %02v:%02v @ %.2fx: %v (%.0f%% match)\n", int(r.params.offset.Minutes()), int((r.params.offset % time.Minute).Seconds()), r.params.ratio, italics(r.res.Artist+" - "+r.res.Title), 100*(1-r.skew))
+		} else {
+			fmt.Fprintf(&sb, "X  %02v:%02v @ %.2fx: <no match>\n", int(r.params.offset.Minutes()), int((r.params.offset % time.Minute).Seconds()), r.params.ratio)
+		}
+	}
+	return sb.String()
+}
+
+type identifySingleModel struct {
+	uri        mediaURI
+	albumIndex int
+	id         *trackIdentifier
+	moon       spinnerModel
+	ellipsis   spinnerModel
+	cassette   *cassetteModel
+	history    *historyModel
+	links      map[string]string
+	err        error
+}
+
+func newSingleModel(uri mediaURI, albumIndex int) *identifySingleModel {
+	return &identifySingleModel{
+		uri:        uri,
+		albumIndex: albumIndex,
+		moon:       newSpinner(spinner.Moon),
+		ellipsis:   newSpinner(spinner.Ellipsis),
+		cassette:   newCassetteModel(),
+		history:    newHistoryModel(),
+	}
+}
+
+func (m *identifySingleModel) cmdStartIdentifying(path string) tea.Cmd {
+	return tea.Sequence(
+		func() tea.Msg {
+			if err := boomboxFadeIn(path); err != nil {
+				return msgError{err}
+			}
+			return nil
+		},
+		m.cmdTryNextParams(m.id.currentParams()),
+	)
+}
+
+func (m *identifySingleModel) cmdTryNextParams(p identifyParams) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			boomboxChangeSpeed(p.ratio)
+			return nil
+		},
+		func() tea.Msg {
+			res, err := identifyPath(m.id.path, p)
+			if err != nil {
+				return msgError{err}
+			}
+			return msgIdentifyResult{res}
+		},
+	)
 }
 
 func (m *identifySingleModel) Init() tea.Cmd {
-	if m.track > 0 {
-		return tea.Batch(m.spinner.tick, cmdFetchPlaylistTrack(m.uri, m.track))
+	fetch := cmdFetchTrack(m.uri)
+	if m.albumIndex > 0 {
+		fetch = cmdFetchPlaylistTrack(m.uri, m.albumIndex)
 	}
-	return tea.Batch(m.spinner.tick, cmdFetchTrack(m.uri))
+	return tea.Batch(fetch, m.moon.tick, m.ellipsis.tick, m.cassette.init())
 }
 
 func (m *identifySingleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -341,23 +423,28 @@ func (m *identifySingleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tea.Quit)
 
 	case spinner.TickMsg:
-		cmds = append(cmds, m.spinner.update(msg))
-		if m.m != nil {
-			cmds = append(cmds, m.m.spinner.update(msg))
-		}
+		cmds = append(cmds, m.moon.update(msg), m.ellipsis.update(msg), m.cassette.update(msg))
 
 	case msgFetchedTrack:
-		m.m = newIdentifyTrackModel(m.uri, "")
-		cmds = append(cmds, m.m.spinner.tick, m.m.cmdStartIdentifying(msg.path))
+		m.id = newTrackIdentifier(msg.path)
+		cmds = append(cmds, m.cmdStartIdentifying(msg.path))
 
 	case msgIdentifyResult:
-		cmds = append(cmds, m.m.cmdHandleResult(msg.ir))
-		if m.m.status == "done" {
-			cmds = append(cmds, cmdFetchLinks(m.m.sample.res.AppleID))
+		m.history.add(msg.ir)
+		if nextParams := m.id.handleResult(msg.ir); nextParams == nil {
+			if m.id.sample != nil {
+				cmds = append(cmds, cmdFetchLinks(m.id.sample.res.AppleID))
+			} else {
+				m.err = fmt.Errorf("no match found")
+				cmds = append(cmds, tea.Quit)
+			}
+		} else {
+			cmds = append(cmds, m.cmdTryNextParams(*nextParams))
 		}
 
 	case msgLinks:
 		m.links = msg.links
+		boomboxFadeOut()
 		cmds = append(cmds, tea.Quit)
 	}
 	return m, tea.Batch(cmds...)
@@ -365,18 +452,40 @@ func (m *identifySingleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *identifySingleModel) View() string {
 	var sb strings.Builder
-	if m.m == nil {
-		fmt.Fprintf(&sb, "%v Fetching track...", m.spinner.view())
+	if m.id == nil {
+		fmt.Fprintf(&sb, "%v Fetching track...", m.moon.view())
 	} else {
-		fmt.Fprintf(&sb, "%v\n", m.m.render())
-		if m.m.status == "done" {
+		waiting := ""
+		if m.id.sample == nil {
+			waiting = fmt.Sprintf("?  %v\n", m.ellipsis.view())
+		}
+		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
+			lipgloss.NewStyle().MarginLeft(4).MarginRight(3).Render(m.cassette.render()),
+			lipgloss.JoinVertical(lipgloss.Left, "\nMatches:\n", m.history.render(8)+waiting),
+		))
+		if m.id.sample != nil {
+			italics := lipgloss.NewStyle().Italic(true).Render
+			fmt.Fprintf(&sb, "\n  ✔️  %v\n", italics(m.id.sample.res.Artist+" - "+m.id.sample.res.Title))
+			if m.id.sample.res.Album != "" {
+				fmt.Fprintf(&sb, "     %v", italics(m.id.sample.res.Album))
+				if m.id.sample.res.Year != "" {
+					fmt.Fprintf(&sb, " (%v)", m.id.sample.res.Year)
+				}
+				fmt.Fprintf(&sb, "\n")
+			}
+			fmt.Fprintf(&sb, "\n")
 			if m.links == nil {
-				fmt.Fprintf(&sb, "%v Fetching links\n", m.spinner.view())
+				fmt.Fprintf(&sb, "%v Fetching links\n", m.moon.view())
 			} else if len(m.links) == 0 {
 				fmt.Fprintf(&sb, "   Streaming links not found :/\n")
 			} else {
-				for site, link := range m.links {
-					fmt.Fprintf(&sb, "  %v: %v\n", site, link)
+				sites := make([]string, 0, len(m.links))
+				for site := range m.links {
+					sites = append(sites, site)
+				}
+				sort.Strings(sites)
+				for _, site := range sites {
+					fmt.Fprintf(&sb, "  %v: %v\n", site, m.links[site])
 				}
 			}
 		}
