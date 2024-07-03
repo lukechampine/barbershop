@@ -28,29 +28,13 @@ func convertSampleRate(x int) int {
 	}[x]
 }
 
-func frequencyBand(hz int) int {
-	switch {
-	case hz < 250:
-		return -1
-	case hz < 520:
-		return 0
-	case hz < 1450:
-		return 1
-	case hz < 3500:
-		return 2
-	case hz <= 5500:
-		return 3
-	default:
-		return -1
-	}
-}
-
 type frequencyPeak struct {
 	pass      int
 	magnitude int
 	bin       int
 }
 
+// A Signature is a unique fingerprint of an audio sample.
 type Signature struct {
 	sampleRate  int
 	numSamples  int
@@ -173,6 +157,8 @@ func (s *Signature) decode(buf []byte) error {
 	return nil
 }
 
+// CollectSample collects duration seconds of audio samples from s, starting at
+// offset.
 func CollectSample(s beep.Streamer, format beep.Format, offset, duration time.Duration) []float64 {
 	samples := make([][2]float64, format.SampleRate.N(time.Second))
 	rem := format.SampleRate.N(offset)
@@ -206,143 +192,133 @@ func CollectSample(s beep.Streamer, format beep.Format, offset, duration time.Du
 	return mono
 }
 
+type ring[T any] struct {
+	buf   []T
+	index int
+}
+
+func (r ring[T]) mod(i int) int {
+	for i < 0 {
+		i += len(r.buf)
+	}
+	return i % len(r.buf)
+}
+
+func (r ring[T]) At(i int) *T {
+	return &r.buf[r.mod(r.index+i)]
+}
+
+func (r ring[T]) Append(x ...T) ring[T] {
+	for len(x) > 0 {
+		n := copy(r.buf[r.index:], x)
+		x = x[n:]
+		r.index = (r.index + n) % len(r.buf)
+	}
+	return r
+}
+
+func (r ring[T]) Slice(s []T, offset int) {
+	offset = r.mod(offset + r.index)
+	for len(s) > 0 {
+		n := copy(s, r.buf[offset:])
+		s = s[n:]
+		offset = (offset + n) % len(r.buf)
+	}
+}
+
+func newRing[T any](size int) ring[T] {
+	return ring[T]{buf: make([]T, size)}
+}
+
+// ComputeSignature computes the audio signature of the provided samples.
 func ComputeSignature(sampleRate int, samples []float64) Signature {
-	var samplesRing [2048]float64
-	var samplesIndex int
-	var reorderedSamplesRing [2048]float64
-	var fftOutputs [256][1025]float64
-	var fftOutputsIndex int
-	var fft *fourier.FFT = fourier.NewFFT(2048)
-	var spreadFFTOutputs [256][1025]float64
-	var spreadFFTOutputsIndex int
-	var numSpreadFFTsDone int
-	sig := Signature{
+	maxNeighbor := func(spreadOutputs ring[[1025]float64], i int) (neighbor float64) {
+		for _, off := range []int{-10, -7, -4, -3, 1, 2, 5, 8} {
+			neighbor = max(neighbor, spreadOutputs.At(-49)[(i+off)])
+		}
+		for _, off := range []int{-53, -45, 165, 172, 179, 186, 193, 200, 214, 221, 228, 235, 242, 249} {
+			neighbor = max(neighbor, spreadOutputs.At(off)[i-1])
+		}
+		return neighbor
+	}
+	normalizePeak := func(x float64) float64 {
+		return math.Log(max(x, 1.0/64))*1477.3 + 6144
+	}
+	peakBand := func(bin int) (int, bool) {
+		hz := (bin * sampleRate) / (2 * 1024 * 64)
+		band, ok := map[bool]int{
+			250 <= hz && hz < 520:    0,
+			520 <= hz && hz < 1450:   1,
+			1450 <= hz && hz < 3500:  2,
+			3500 <= hz && hz <= 5500: 3,
+		}[true]
+		return band, ok
+	}
+
+	fft := fourier.NewFFT(2048)
+	samplesRing := newRing[float64](2048)
+	fftOutputs := newRing[[1025]float64](256)
+	spreadOutputs := newRing[[1025]float64](256)
+	var peaksByBand [5][]frequencyPeak
+	for i := 0; i*128+128 < len(samples); i++ {
+		samplesRing = samplesRing.Append(samples[i*128:][:128]...)
+
+		// Perform FFT
+		reorderedSamples := make([]float64, 2048)
+		samplesRing.Slice(reorderedSamples, 0)
+		for i, m := range hanningMultipliers {
+			reorderedSamples[i] = math.Round(reorderedSamples[i]*1024*64) * m
+		}
+		var outputs [1025]float64
+		for i, c := range fft.Coefficients(nil, reorderedSamples) {
+			outputs[i] = max((real(c)*real(c)+imag(c)*imag(c))/(1<<17), 0.0000000001)
+		}
+		fftOutputs = fftOutputs.Append(outputs)
+
+		// Spread peaks, both in the frequency domain...
+		for i := 0; i < len(outputs)-2; i++ {
+			outputs[i] = max(outputs[i], outputs[i+1], outputs[i+2])
+		}
+		spreadOutputs = spreadOutputs.Append(outputs)
+		// ... and in the time domain
+		for _, off := range []int{-2, -4, -7} {
+			prev := spreadOutputs.At(off)
+			for i := range prev {
+				prev[i] = max(prev[i], outputs[i])
+			}
+		}
+
+		// Accumulate samples until we have enough...
+		if i < 45 {
+			continue
+		}
+		// ...then recognize peaks
+		fftOutput := fftOutputs.At(-46)
+		for bin := 10; bin < 1015; bin++ {
+			// Ensure that this is a frequency- and time-domain local maximum
+			if fftOutput[bin] <= maxNeighbor(spreadOutputs, bin) {
+				continue
+			}
+			// Normalize and compute frequency band
+			before := normalizePeak(fftOutput[bin-1])
+			peak := normalizePeak(fftOutput[bin])
+			after := normalizePeak(fftOutput[bin+1])
+			variation := int((32 * (after - before)) / (2*peak - after - before))
+			peakBin := bin*64 + variation
+			band, ok := peakBand(peakBin)
+			if !ok {
+				continue
+			}
+			peaksByBand[band] = append(peaksByBand[band], frequencyPeak{
+				pass:      i - 45,
+				magnitude: int(peak),
+				bin:       peakBin,
+			})
+		}
+	}
+	return Signature{
 		sampleRate:  sampleRate,
 		numSamples:  len(samples),
-		peaksByBand: [5][]frequencyPeak{},
+		peaksByBand: peaksByBand,
 	}
-
-	doFFT := func(s16_mono_16khz_buffer []float64) {
-		for i := range s16_mono_16khz_buffer {
-			s16_mono_16khz_buffer[i] = math.Round(s16_mono_16khz_buffer[i] * 65536) // XX
-		}
-		copy(samplesRing[samplesIndex:samplesIndex+128], s16_mono_16khz_buffer)
-		samplesIndex = (samplesIndex + 128) % len(samplesRing)
-
-		// Reorder the items (put the latest data at end) and apply Hanning window
-		for i, m := range hanning_multipliers {
-			reorderedSamplesRing[i] = samplesRing[(i+samplesIndex)%len(samplesRing)] * m
-		}
-
-		// Perform Fast Fourier transform
-		complex_fft_results := fft.Coefficients(nil, reorderedSamplesRing[:])
-		if len(complex_fft_results) != 1025 {
-			panic("unexpected length")
-		}
-
-		// Turn complex into reals, and put the results into a local array
-		for i := range complex_fft_results {
-			re, im := real(complex_fft_results[i]), imag(complex_fft_results[i])
-			fftOutputs[fftOutputsIndex][i] = max((re*re+im*im)/(1<<17), 0.0000000001)
-		}
-		fftOutputsIndex = (fftOutputsIndex + 1) % len(fftOutputs)
-	}
-
-	spreadPeaks := func() {
-		spread_fft_results := fftOutputs[(fftOutputsIndex-1+256)%256]
-
-		// Perform frequency-domain spreading of peak values
-		for i := 0; i < 1023; i++ {
-			spread_fft_results[i] = max(spread_fft_results[i], spread_fft_results[i+1], spread_fft_results[i+2])
-		}
-
-		// Perform time-domain spreading of peak values
-		for i := 0; i < 1025; i++ {
-			max_value := spread_fft_results[i]
-			for _, j := range []int{1, 3, 6} {
-				former_fft_output := &spreadFFTOutputs[((spreadFFTOutputsIndex - j + 256) % 256)]
-				max_value = max(former_fft_output[i], max_value)
-				former_fft_output[i] = max_value
-			}
-		}
-
-		spreadFFTOutputs[spreadFFTOutputsIndex] = spread_fft_results
-		spreadFFTOutputsIndex = (spreadFFTOutputsIndex + 1) % 256
-	}
-
-	doPeakRecognition := func() {
-		// Note: when substracting an array index, casting to signed is needed
-		// to avoid underflow panics at runtime.
-
-		fft_minus_46 := &fftOutputs[((fftOutputsIndex - 46 + 256) % 256)]
-		fft_minus_49 := &spreadFFTOutputs[((spreadFFTOutputsIndex - 49 + 256) % 256)]
-
-		for bin_position := 10; bin_position < 1015; bin_position++ {
-
-			// Ensure that the bin is large enough to be a peak
-			if fft_minus_46[bin_position] >= 1.0/64.0 && fft_minus_46[bin_position] >= fft_minus_49[bin_position-1] {
-
-				// Ensure that it is frequency-domain local minimum
-				max_neighbor_in_fft_minus_49 := 0.0
-
-				for _, neighbor_offset := range []int{-10, -7, -4, -3, 1, 2, 5, 8} {
-					max_neighbor_in_fft_minus_49 = max(max_neighbor_in_fft_minus_49, fft_minus_49[(bin_position+neighbor_offset)])
-				}
-
-				if fft_minus_46[bin_position] > max_neighbor_in_fft_minus_49 {
-					// Ensure that it is a time-domain local minimum
-					max_neighbor_in_other_adjacent_ffts := max_neighbor_in_fft_minus_49
-
-					for _, other_offset := range []int{-53, -45, 165, 172, 179, 186, 193, 200, 214, 221, 228, 235, 242, 249} {
-						other_fft := &spreadFFTOutputs[((spreadFFTOutputsIndex + other_offset + 256) % 256)]
-						max_neighbor_in_other_adjacent_ffts = max(max_neighbor_in_other_adjacent_ffts, other_fft[bin_position-1])
-					}
-
-					if fft_minus_46[bin_position] > max_neighbor_in_other_adjacent_ffts {
-						// This is a peak, store the peak
-						fft_pass_number := numSpreadFFTsDone - 46
-
-						peak_magnitude := math.Log(max(fft_minus_46[bin_position], 1.0/64.0))*1477.3 + 6144.0
-						peak_magnitude_before := math.Log(max(fft_minus_46[bin_position-1], 1.0/64.0))*1477.3 + 6144.0
-						peak_magnitude_after := math.Log(max(fft_minus_46[bin_position+1], 1.0/64.0))*1477.3 + 6144.0
-
-						peak_variation_1 := peak_magnitude*2.0 - peak_magnitude_before - peak_magnitude_after
-						peak_variation_2 := (peak_magnitude_after - peak_magnitude_before) * 32.0 / peak_variation_1
-						if peak_variation_1 < 0 {
-							panic("unexpected")
-						}
-
-						corrected_peak_frequency_bin := int((float64(bin_position*64) + (peak_variation_2)))
-
-						// Convert back a FFT bin to a frequency, given a 16 KHz sample
-						// rate, 1024 useful bins and the multiplication by 64 made before
-						// storing the information
-						frequency_hz := int(float64(corrected_peak_frequency_bin) * (float64(sampleRate) / 2.0 / 1024.0 / 64.0))
-
-						// Ignore peaks outside the 250 Hz-5.5 KHz range, store them into
-						// a lookup table that will be used to generate the binary fingerprint
-						// otherwise
-						frequency_band := frequencyBand(frequency_hz)
-						if frequency_band == -1 {
-							continue
-						}
-						sig.peaksByBand[frequency_band] = append(sig.peaksByBand[frequency_band], frequencyPeak{
-							pass:      fft_pass_number,
-							magnitude: int(peak_magnitude),
-							bin:       corrected_peak_frequency_bin,
-						})
-					}
-				}
-			}
-		}
-	}
-
-	for i := 0; i+128 < len(samples); i += 128 {
-		doFFT(samples[i : i+128])
-		spreadPeaks()
-		if numSpreadFFTsDone++; numSpreadFFTsDone >= 46 {
-			doPeakRecognition()
-		}
-	}
-	return sig
 }

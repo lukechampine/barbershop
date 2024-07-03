@@ -22,6 +22,7 @@ var throttle = func() func() {
 	}
 }()
 
+// A Result contains the result of attempting to identify a song.
 type Result struct {
 	Found   bool
 	Skew    float64
@@ -32,6 +33,7 @@ type Result struct {
 	AppleID string
 }
 
+// Identify attempts to identify a song from its audio signature.
 func Identify(sig Signature) (Result, error) {
 	reqData := fmt.Sprintf(`{
 		"geolocation": {
@@ -131,6 +133,7 @@ again:
 	}, nil
 }
 
+// Links returns various streaming links for the song with the given ID.
 func Links(appleID string) (map[string]string, error) {
 	resp, err := http.Get(fmt.Sprintf("https://api.song.link/v1-alpha.1/links?type=song&songIfSingle=true&platform=appleMusic&id=%v", appleID))
 	if err != nil {

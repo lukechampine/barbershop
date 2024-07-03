@@ -1,6 +1,6 @@
 package shazam
 
-var hanning_multipliers = [2048]float64{
+var hanningMultipliers = [2048]float64{
 	0.0000023508,
 	0.0000094032,
 	0.000021157,
