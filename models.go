@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -30,11 +32,33 @@ type (
 	}
 )
 
+func renderOffset(offset time.Duration) string {
+	return fmt.Sprintf("%02v:%02v", int(offset.Minutes()), int((offset % time.Minute).Seconds()))
+}
+
+func renderRatio(ratio float64) string {
+	color := lipgloss.Color([]string{
+		"129", "039", "050",
+		"046", "190", "226",
+		"208", "202", "196",
+	}[min(max(int(math.Round(20*ratio)-14)/2, 0), 8)])
+	return lipgloss.NewStyle().Foreground(color).Render(fmt.Sprintf("%.2fx", ratio))
+}
+
 type spinnerModel struct {
-	s spinner.Model
+	s  spinner.Model
+	mu sync.Mutex
+}
+
+func (m *spinnerModel) setFPS(fps time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.s.Spinner.FPS = fps
 }
 
 func (m *spinnerModel) tick() tea.Msg {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.s.Tick()
 }
 
@@ -51,7 +75,7 @@ func (m *spinnerModel) view() string {
 }
 
 func newSpinner(s spinner.Spinner) spinnerModel {
-	return spinnerModel{spinner.New(spinner.WithSpinner(s))}
+	return spinnerModel{s: spinner.New(spinner.WithSpinner(s))}
 }
 
 type identifyTrackModel struct {
@@ -139,12 +163,12 @@ func (m *identifyTrackModel) render() string {
 		} else if p.offset == 60*time.Second {
 			dots = "✔✔?"
 		}
-		fmt.Fprintf(&sb, "(%v)  Trying %.2fx %v  (%v)", m.spinner.view(), p.ratio, dots, m.spinner.view())
+		fmt.Fprintf(&sb, "(%v)  Trying %v %v  (%v)", m.spinner.view(), renderRatio(p.ratio), dots, m.spinner.view())
 	case "skipped":
 		fmt.Fprintf(&sb, "<skipped>")
 	case "done":
 		if s := m.id.sample; s != nil {
-			fmt.Fprintf(&sb, "✔  %v - %v (%.0f%% match @ %.2fx speed)", s.res.Artist, s.res.Title, 100*(1-s.skew), s.params.ratio)
+			fmt.Fprintf(&sb, "✔  %v - %v (%.0f%% match @ %v speed)", s.res.Artist, s.res.Title, 100*(1-s.skew), s.params.ratio)
 		} else {
 			fmt.Fprintf(&sb, "X  Match not found :/")
 		}
@@ -311,7 +335,7 @@ func (m *cassetteModel) render() string {
 		"   ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁\n"+
 		" \u2571│............................│\n"+
 		"│ │: %v ???? %v :│\n"+
-		"│ │:   %02v:%02v           %.2fx  :│\n"+
+		"│ │:   %v           %v  :│\n"+
 		"│ │:     ,─.   ▁▁▁▁▁   ,─.    :|\n"+
 		"│ │:    ( %v)) [▁▁▁▁▁] ( %v))   :|\n"+
 		"│v│:     `─`   ' ' '   `─`    :│\n"+
@@ -321,7 +345,7 @@ func (m *cassetteModel) render() string {
 		"│\u2571`───\u2571────────────────────`───│\n"+
 		"`.▁▁▁\u2571 \u2571====\u2571 \u2571=\u2571\u2571=\u2571 \u2571====\u2571▁▁▁\u2571\n"+
 		"     `────────────────────'\n",
-		m.noise.view(), reverse(m.noise.view()), int(offset.Minutes()), int((offset % time.Minute).Seconds()), ratio, m.gears.view(), m.gears.view())
+		m.noise.view(), reverse(m.noise.view()), renderOffset(offset), renderRatio(ratio), m.gears.view(), m.gears.view())
 }
 
 type historyModel struct {
@@ -338,13 +362,15 @@ func (m *historyModel) add(r identifyResult) {
 
 func (m *historyModel) render(n int) string {
 	italics := lipgloss.NewStyle().Italic(true).Render
+	green := lipgloss.NewStyle().Foreground(lipgloss.Color("046")).Render
+	red := lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render
 	var sb strings.Builder
 	for i := max(0, len(m.entries)-n); i < len(m.entries); i++ {
 		r := m.entries[i]
 		if r.res.Found {
-			fmt.Fprintf(&sb, "✔️  %02v:%02v @ %.2fx: %v (%.0f%% match)\n", int(r.params.offset.Minutes()), int((r.params.offset % time.Minute).Seconds()), r.params.ratio, italics(r.res.Artist+" - "+r.res.Title), 100*(1-r.skew))
+			fmt.Fprintf(&sb, "%v  %v @ %v: %v (%.0f%% match)\n", green("✔️"), renderOffset(r.params.offset), renderRatio(r.params.ratio), italics(r.res.Artist+" - "+r.res.Title), 100*(1-r.skew))
 		} else {
-			fmt.Fprintf(&sb, "X  %02v:%02v @ %.2fx: <no match>\n", int(r.params.offset.Minutes()), int((r.params.offset % time.Minute).Seconds()), r.params.ratio)
+			fmt.Fprintf(&sb, "%v  %v @ %v: <no match>\n", red("X"), renderOffset(r.params.offset), renderRatio(r.params.ratio))
 		}
 	}
 	return sb.String()
@@ -363,11 +389,15 @@ type identifySingleModel struct {
 }
 
 func newSingleModel(uri mediaURI, albumIndex int) *identifySingleModel {
+	ellipsis := spinner.Spinner{
+		Frames: spinner.Ellipsis.Frames,
+		FPS:    time.Second / 2,
+	}
 	return &identifySingleModel{
 		uri:        uri,
 		albumIndex: albumIndex,
 		moon:       newSpinner(spinner.Moon),
-		ellipsis:   newSpinner(spinner.Ellipsis),
+		ellipsis:   newSpinner(ellipsis),
 		cassette:   newCassetteModel(),
 		history:    newHistoryModel(),
 	}
@@ -423,6 +453,11 @@ func (m *identifySingleModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tea.Quit)
 
 	case spinner.TickMsg:
+		if m.id != nil {
+			p := m.id.currentParams()
+			m.cassette.gears.setFPS((time.Second / 5) / time.Duration(100*p.ratio) * 100)
+			m.cassette.noise.setFPS((time.Second / 20) / time.Duration(100*p.ratio) * 100)
+		}
 		cmds = append(cmds, m.moon.update(msg), m.ellipsis.update(msg), m.cassette.update(msg))
 
 	case msgFetchedTrack:
@@ -457,11 +492,12 @@ func (m *identifySingleModel) View() string {
 	} else {
 		waiting := ""
 		if m.id.sample == nil {
-			waiting = fmt.Sprintf("?  %v\n", m.ellipsis.view())
+			p := m.id.currentParams()
+			waiting = fmt.Sprintf("?  %v @ %v: %v\n", renderOffset(p.offset), renderRatio(p.ratio), m.ellipsis.view())
 		}
 		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
-			lipgloss.NewStyle().MarginLeft(4).MarginRight(3).Render(m.cassette.render()),
-			lipgloss.JoinVertical(lipgloss.Left, "\nMatches:\n", m.history.render(8)+waiting),
+			lipgloss.NewStyle().MarginLeft(4).MarginRight(4).Render(m.cassette.render()),
+			lipgloss.JoinVertical(lipgloss.Left, lipgloss.NewStyle().Underline(true).Render("\nMatches:\n"), m.history.render(8)+waiting),
 		))
 		if m.id.sample != nil {
 			italics := lipgloss.NewStyle().Italic(true).Render

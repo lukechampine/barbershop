@@ -114,7 +114,7 @@ func cmdFetchTrack(uri mediaURI) tea.Cmd {
 			url := fmt.Sprintf("https://%v.bandcamp.com/track/%v", uri.ArtistID, uri.Slug)
 			if _, err := os.Stat(path); err == nil {
 				return msgFetchedTrack{path}
-			} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, url); err != nil {
+			} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", url); err != nil {
 				return msgError{err}
 			}
 			return msgFetchedTrack{path}
@@ -122,7 +122,7 @@ func cmdFetchTrack(uri mediaURI) tea.Cmd {
 			path := os.TempDir() + "/barbershop_youtube_" + url.PathEscape(uri.Title) + ".wav"
 			if _, err := os.Stat(path); err == nil {
 				return msgFetchedTrack{path}
-			} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, uri.ID); err != nil {
+			} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", uri.ID); err != nil {
 				return msgError{err}
 			}
 			return msgFetchedTrack{path}

@@ -41,7 +41,7 @@ func openStreamer(path string) (beep.StreamSeekCloser, beep.Format, error) {
 }
 
 // global playback
-var bb struct {
+var bb = struct {
 	r      *beep.Resampler
 	v      *effects.Volume
 	silent bool
@@ -50,15 +50,14 @@ var bb struct {
 	offset  time.Duration
 	ratio   float64
 	stateMu sync.Mutex
+}{
+	ratio: 1,
 }
 
 func boomboxState() (time.Duration, float64) {
 	bb.stateMu.Lock()
 	defer bb.stateMu.Unlock()
-	if bb.r == nil {
-		return 0, 1
-	}
-	return bb.offset, bb.r.Ratio()
+	return bb.offset, bb.ratio
 }
 
 func boomboxFadeIn(path string) error {
@@ -183,7 +182,7 @@ func identifyPath(path string, params identifyParams) (identifyResult, error) {
 	return identifyResult{
 		params: params,
 		res:    res,
-		skew:   math.Abs(res.Skew),
+		skew:   min(10*math.Abs(res.Skew), 1),
 	}, nil
 }
 
