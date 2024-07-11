@@ -6,7 +6,6 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/faiface/beep"
@@ -40,79 +39,118 @@ func openStreamer(path string) (beep.StreamSeekCloser, beep.Format, error) {
 	}
 }
 
-// global playback
-var bb = struct {
-	r      *beep.Resampler
-	v      *effects.Volume
-	silent bool
-	mu     sync.Mutex
+type audioBuffer struct {
+	format          beep.Format
+	samples         [][2]float64
+	start, pos, end int
 
-	offset  time.Duration
-	ratio   float64
-	stateMu sync.Mutex
-}{
-	ratio: 1,
+	r *beep.Resampler
+	v *effects.Volume
 }
 
-func boomboxState() (time.Duration, float64) {
-	bb.stateMu.Lock()
-	defer bb.stateMu.Unlock()
-	return bb.offset, bb.ratio
+func (ab *audioBuffer) seek(delta time.Duration) {
+	ab.pos += ab.format.SampleRate.N(delta)
+	ab.pos = max(ab.start, min(ab.pos, ab.end))
+}
+
+func (ab *audioBuffer) setRatio(r float64) {
+	ab.r.SetRatio(r)
+}
+
+func (ab *audioBuffer) setVolume(v float64) {
+	ab.v.Volume = v
+}
+
+func (ab *audioBuffer) times() (pos, total time.Duration) {
+	return ab.format.SampleRate.D(ab.pos), ab.format.SampleRate.D(len(ab.samples))
+}
+
+func (ab *audioBuffer) Stream(samples [][2]float64) (n int, ok bool) {
+	return ab.v.Stream(samples)
+}
+
+func (ab *audioBuffer) Err() error {
+	return ab.v.Err()
+}
+
+func newAudioBuffer(format beep.Format, stream beep.Streamer) *audioBuffer {
+	ab := &audioBuffer{format: format}
+	for {
+		var samples [512][2]float64
+		n, ok := stream.Stream(samples[:])
+		ab.samples = append(ab.samples, samples[:n]...)
+		if !ok {
+			break
+		}
+	}
+	ab.end = len(ab.samples)
+	abStream := func(samples [][2]float64) (n int, ok bool) {
+		if ab.pos >= ab.end {
+			ab.pos = ab.start
+		}
+		n = copy(samples, ab.samples[ab.pos:ab.end])
+		ab.pos += n
+		return n, true
+	}
+	ab.r = beep.ResampleRatio(4, 1.0, beep.StreamerFunc(abStream))
+	ab.v = &effects.Volume{
+		Streamer: ab.r,
+		Base:     2,
+		Volume:   0,
+	}
+	return ab
+}
+
+// global playback
+var bb = struct {
+	buf    *audioBuffer
+	silent bool
+}{}
+
+func boomboxState() (pos, duration time.Duration, ratio float64) {
+	speaker.Lock()
+	defer speaker.Unlock()
+	if bb.buf == nil {
+		return 0, 0, 1
+	}
+	pos, duration = bb.buf.times()
+	ratio = bb.buf.r.Ratio()
+	return
 }
 
 func boomboxFadeIn(path string) error {
 	if bb.silent {
 		return nil
 	}
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
 	stream, format, err := openStreamer(path)
 	if err != nil {
 		return err
 	}
-	oldv := bb.v
-	if oldv == nil {
+	newBuf := newAudioBuffer(format, stream)
+	newBuf.setVolume(-5)
+
+	speaker.Lock()
+	oldBuf := bb.buf
+	bb.buf = newBuf
+	speaker.Unlock()
+	if oldBuf == nil {
 		// crossfade with silence
-		oldv = &effects.Volume{
-			Streamer: beep.Silence(-1),
-			Base:     2,
-			Volume:   0,
-		}
+		oldBuf = newAudioBuffer(format, beep.Silence(format.SampleRate.N(3*time.Second)))
 		if err := speaker.Init(format.SampleRate, format.SampleRate.N(100*time.Millisecond)); err != nil {
 			return err
 		}
-		speaker.Play(oldv)
+		speaker.Play(oldBuf)
 	}
-	newr := beep.ResampleRatio(4, 1.0, stream)
-	newv := &effects.Volume{
-		Streamer: newr,
-		Base:     2,
-		Volume:   -5,
-	}
-	speaker.Play(beep.StreamerFunc(func(samples [][2]float64) (int, bool) {
-		n, ok := newv.Stream(samples)
-		bb.stateMu.Lock()
-		bb.offset += format.SampleRate.D(n)
-		bb.stateMu.Unlock()
-		return n, ok
-	}))
-	for oldv.Volume > -5 {
+	speaker.Play(newBuf)
+	for i := 0.0; i <= 50; i++ {
 		speaker.Lock()
-		oldv.Volume -= 0.1
-		newv.Volume += 0.1
+		newBuf.setVolume(-5 + (i * 0.1))
+		oldBuf.setVolume(0 - (i * 0.1))
 		speaker.Unlock()
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(40 * time.Millisecond)
 	}
 	speaker.Clear()
-	speaker.Play(beep.StreamerFunc(func(samples [][2]float64) (int, bool) {
-		n, ok := newv.Stream(samples)
-		bb.stateMu.Lock()
-		bb.offset += format.SampleRate.D(n)
-		bb.stateMu.Unlock()
-		return n, ok
-	}))
-	bb.r = newr
-	bb.v = newv
+	speaker.Play(newBuf)
 	return nil
 }
 
@@ -120,15 +158,15 @@ func boomboxFadeOut() {
 	if bb.silent {
 		return
 	}
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	for bb.v.Volume > 0 {
+	for i := 0.0; i <= 50; i++ {
 		speaker.Lock()
-		bb.v.Volume -= 0.1
+		bb.buf.setVolume(0 - (i * 0.1))
 		speaker.Unlock()
 		time.Sleep(50 * time.Millisecond)
 	}
-	bb.v.Silent = true
+	speaker.Lock()
+	bb.buf.v.Silent = true
+	speaker.Unlock()
 	speaker.Clear()
 }
 
@@ -136,24 +174,38 @@ func boomboxChangeSpeed(speedup float64) {
 	if bb.silent {
 		return
 	}
-	bb.mu.Lock()
-	defer bb.mu.Unlock()
-	for math.Abs(speedup-bb.r.Ratio()) > 0.01 {
-		speaker.Lock()
-		r := bb.r.Ratio() + (speedup-bb.r.Ratio())/10
-		bb.r.SetRatio(r)
+	speaker.Lock()
+	for math.Abs(speedup-bb.buf.r.Ratio()) > 0.01 {
+		r := bb.buf.r.Ratio() + (speedup-bb.buf.r.Ratio())/10
+		bb.buf.setRatio(r)
 		speaker.Unlock()
-		bb.stateMu.Lock()
-		bb.ratio = r
-		bb.stateMu.Unlock()
 		time.Sleep(100 * time.Millisecond)
+		speaker.Lock()
+	}
+	bb.buf.setRatio(speedup)
+	speaker.Unlock()
+}
+
+func boomboxSetSpeed(speedup float64) {
+	if bb.silent {
+		return
 	}
 	speaker.Lock()
-	bb.r.SetRatio(speedup)
+	if bb.buf != nil {
+		bb.buf.setRatio(speedup)
+	}
 	speaker.Unlock()
-	bb.stateMu.Lock()
-	bb.ratio = speedup
-	bb.stateMu.Unlock()
+}
+
+func boomboxSeek(delta time.Duration) {
+	if bb.silent {
+		return
+	}
+	speaker.Lock()
+	if bb.buf != nil {
+		bb.buf.seek(delta)
+	}
+	speaker.Unlock()
 }
 
 type identifyParams struct {
@@ -213,7 +265,7 @@ func (id *trackIdentifier) currentParams() identifyParams {
 func (id *trackIdentifier) handleResult(r identifyResult) (nextParams *identifyParams) {
 	if !r.res.Found {
 		// skip to the next speedup without trying other offsets
-		for len(id.params) > 1 && id.params[0].ratio == r.params.ratio {
+		for len(id.params) > 2 && id.params[1].ratio == r.params.ratio {
 			id.params = id.params[1:]
 		}
 	} else {
