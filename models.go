@@ -15,7 +15,8 @@ import (
 )
 
 type (
-	msgError struct {
+	msgClearHighlight struct{}
+	msgError          struct {
 		err error
 	}
 	msgFetchedTrack struct {
@@ -43,6 +44,42 @@ func renderRatio(ratio float64) string {
 		"208", "202", "196",
 	}[min(max(int(math.Round(20*ratio)-14)/2, 0), 8)])
 	return lipgloss.NewStyle().Foreground(color).Render(fmt.Sprintf("%.2fx", ratio))
+}
+
+type highlightModel struct {
+	key       string
+	clearTime time.Time
+}
+
+func (m *highlightModel) cmdHighlight(key string) tea.Cmd {
+	m.clearTime = time.Now().Add(100 * time.Millisecond)
+	if m.key != "" {
+		m.key = key
+		return nil
+	}
+	m.key = key
+	return func() tea.Msg {
+		time.Sleep(100 * time.Millisecond)
+		return msgClearHighlight{}
+	}
+}
+
+func (m *highlightModel) cmdClear() tea.Cmd {
+	if rem := time.Until(m.clearTime); rem > 0 {
+		return func() tea.Msg {
+			time.Sleep(rem)
+			return msgClearHighlight{}
+		}
+	}
+	m.key = ""
+	return nil
+}
+
+func (m *highlightModel) render(keys map[string]string) map[string]string {
+	if k, ok := keys[m.key]; ok {
+		keys[m.key] = lipgloss.NewStyle().Background(lipgloss.Color("255")).Render(k)
+	}
+	return keys
 }
 
 type spinnerModel struct {
@@ -544,6 +581,7 @@ type identifyManualModel struct {
 	path       string
 	params     identifyParams
 	trying     *identifyParams
+	highlight  highlightModel
 	moon       spinnerModel
 	ellipsis   spinnerModel
 	cassette   *cassetteModel
@@ -618,6 +656,10 @@ func (m *identifyManualModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			cmds = append(cmds, tea.Quit)
 		}
+		cmds = append(cmds, m.highlight.cmdHighlight(msg.String()))
+
+	case msgClearHighlight:
+		cmds = append(cmds, m.highlight.cmdClear())
 
 	case msgError:
 		m.err = msg.err
@@ -658,6 +700,7 @@ func (m *identifyManualModel) View() string {
 	var sb strings.Builder
 	if m.path == "" {
 		fmt.Fprintf(&sb, "%v Fetching track...", m.moon.view())
+		fmt.Fprint(&sb, "\n[q] quit")
 	} else {
 		waiting := ""
 		if m.trying != nil {
@@ -682,8 +725,18 @@ func (m *identifyManualModel) View() string {
 			lipgloss.NewStyle().MarginLeft(4).MarginRight(4).Render(m.cassette.render()),
 			lipgloss.JoinVertical(lipgloss.Left, lipgloss.NewStyle().Underline(true).Render("\nMatches:\n"), m.history.render(8)+waiting+links),
 		))
+		keys := m.highlight.render(map[string]string{
+			"up":    "⬆",
+			"down":  "⬇",
+			"left":  "⬅",
+			"right": "⮕",
+			"enter": "enter",
+			"l":     "l",
+			"q":     "q",
+		})
+		fmt.Fprintf(&sb, "\n[%v / %v] adjust speed   [%v / %v] seek   [%v] submit   [%v] links   [%v] quit",
+			keys["up"], keys["down"], keys["left"], keys["right"], keys["enter"], keys["l"], keys["q"])
 	}
-	fmt.Fprint(&sb, "\n[⬆ / ⬇] adjust speed   [⬅ / ⮕] seek   [enter] submit   [l] links   [q] quit")
 	if m.err != nil {
 		fmt.Fprintf(&sb, "\nError: %v\n", m.err)
 	}

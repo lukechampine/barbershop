@@ -30,9 +30,9 @@ func main() {
 	rootCmd.Usage = flagg.SimpleUsage(rootCmd, rootUsage)
 	versionCmd := flagg.New("version", versionUsage)
 	idCmd := flagg.New("id", idUsage)
-	idCmd.BoolVar(&bb.silent, "silent", false, "don't play audio during identification")
-	track := idCmd.Int("track", 0, "identify the n-th track in the album")
-	manual := idCmd.Bool("manual", false, "control speed and sample offset+duration manually")
+	idCmd.BoolVar(&bb.silent, "silent", false, "don't play audio")
+	track := idCmd.Int("track", 0, "identify the n-th track of the album")
+	manual := idCmd.Bool("manual", false, "control speed and sample offset manually")
 
 	cmd := flagg.Parse(flagg.Tree{
 		Cmd: rootCmd,
@@ -57,7 +57,7 @@ func main() {
 			log.Fatalln("Error:", err)
 		} else if !isAlbum && *track != 0 {
 			log.Fatalln("Error: --track flag is only valid for albums")
-		} else if isAlbum && *manual {
+		} else if isAlbum && *manual && *track == 0 {
 			log.Fatalln("Error: --manual flag is only valid for single tracks")
 		}
 		var m tea.Model
