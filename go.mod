@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/lipgloss v0.9.1
 	github.com/faiface/beep v1.1.0
 	github.com/google/uuid v1.6.0
+	github.com/julienschmidt/httprouter v1.3.0
 	github.com/mattn/go-runewidth v0.0.15
 	golang.org/x/time v0.5.0
 	gonum.org/v1/gonum v0.15.0

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -44,6 +45,40 @@ func renderRatio(ratio float64) string {
 		"208", "202", "196",
 	}[min(max(int(math.Round(20*ratio)-14)/2, 0), 8)])
 	return lipgloss.NewStyle().Foreground(color).Render(fmt.Sprintf("%.2fx", ratio))
+}
+
+func cmdFetchTrack(uri mediaURI) tea.Cmd {
+	return func() tea.Msg {
+		path, err := fetchTrack(uri)
+		if err != nil {
+			return msgError{err}
+		}
+		return msgFetchedTrack{path}
+	}
+}
+
+func cmdFetchPlaylist(uri mediaURI) tea.Cmd {
+	return func() tea.Msg {
+		pl, err := fetchPlaylist(uri)
+		if err != nil {
+			return msgError{err}
+		}
+		return msgFetchedPlaylist{pl}
+	}
+}
+
+func cmdFetchPlaylistTrack(uri mediaURI, track int) tea.Cmd {
+	return func() tea.Msg {
+		r := cmdFetchPlaylist(uri)()
+		pl, ok := r.(msgFetchedPlaylist)
+		if !ok {
+			return r
+		}
+		if track < 1 || track > len(pl.pl.Entries) {
+			return msgError{errors.New("invalid track number")}
+		}
+		return cmdFetchTrack(pl.pl.Entries[track-1].URI)()
+	}
 }
 
 type highlightModel struct {

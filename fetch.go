@@ -104,31 +104,29 @@ func resolveURI(uri string) (mediaURI, bool, error) {
 	return ytpl, len(ytpl.Chapters) > 0, nil
 }
 
-func cmdFetchTrack(uri mediaURI) tea.Cmd {
-	return func() tea.Msg {
-		switch uri := uri.(type) {
-		case mediaFile:
-			return msgFetchedTrack{uri.Path}
-		case mediaBandcamp:
-			path := os.TempDir() + "/barbershop_bandcamp_" + url.PathEscape(uri.ArtistID+"_"+uri.Slug) + ".wav"
-			url := fmt.Sprintf("https://%v.bandcamp.com/track/%v", uri.ArtistID, uri.Slug)
-			if _, err := os.Stat(path); err == nil {
-				return msgFetchedTrack{path}
-			} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", url); err != nil {
-				return msgError{err}
-			}
-			return msgFetchedTrack{path}
-		case mediaYouTube:
-			path := os.TempDir() + "/barbershop_youtube_" + url.PathEscape(uri.Title) + ".wav"
-			if _, err := os.Stat(path); err == nil {
-				return msgFetchedTrack{path}
-			} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", uri.ID); err != nil {
-				return msgError{err}
-			}
-			return msgFetchedTrack{path}
-		default:
-			panic(fmt.Sprintf("unhandled mediaURI type: %T", uri))
+func fetchTrack(uri mediaURI) (string, error) {
+	switch uri := uri.(type) {
+	case mediaFile:
+		return uri.Path, nil
+	case mediaBandcamp:
+		path := os.TempDir() + "/barbershop_bandcamp_" + url.PathEscape(uri.ArtistID+"_"+uri.Slug) + ".wav"
+		url := fmt.Sprintf("https://%v.bandcamp.com/track/%v", uri.ArtistID, uri.Slug)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", url); err != nil {
+			return "", err
 		}
+		return path, nil
+	case mediaYouTube:
+		path := os.TempDir() + "/barbershop_youtube_" + url.PathEscape(uri.Title) + ".wav"
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", uri.ID); err != nil {
+			return "", err
+		}
+		return path, nil
+	default:
+		panic(fmt.Sprintf("unhandled mediaURI type: %T", uri))
 	}
 }
 
@@ -142,96 +140,80 @@ type playlist struct {
 	Entries []playlistEntry
 }
 
-func cmdFetchPlaylist(uri mediaURI) tea.Cmd {
-	return func() tea.Msg {
-		switch uri := uri.(type) {
-		case mediaFile:
-			pl := playlist{
-				Title: uri.Path,
-			}
-			files, err := os.ReadDir(uri.Path)
-			if err != nil {
-				return msgError{err}
-			}
-			for _, file := range files {
-				pl.Entries = append(pl.Entries, playlistEntry{
-					Title: file.Name(),
-					URI: mediaFile{
-						Path: uri.Path + "/" + file.Name(),
-					},
-				})
-			}
-			return msgFetchedPlaylist{pl}
-
-		case mediaBandcamp:
-			var bcpl struct {
-				ArtistID string `json:"uploader_id"`
-				Title    string
-				Entries  []struct {
-					Title string
-					URL   string
-				}
-			}
-			url := fmt.Sprintf("https://%v.bandcamp.com/album/%v", uri.ArtistID, uri.Slug)
-			if out, err := execCmd("yt-dlp", "-J", "--flat-playlist", url); err != nil {
-				return msgError{err}
-			} else if err := json.Unmarshal(out, &bcpl); err != nil {
-				return msgError{err}
-			}
-			pl := playlist{
-				Title:   bcpl.ArtistID + " - " + bcpl.Title, // TODO: fetch a nicer artist name
-				Entries: make([]playlistEntry, len(bcpl.Entries)),
-			}
-			for i := range pl.Entries {
-				_, slug, _ := strings.Cut(bcpl.Entries[i].URL, "track/")
-				pl.Entries[i].Title = bcpl.Entries[i].Title
-				pl.Entries[i].URI = mediaBandcamp{
-					ArtistID: uri.ArtistID,
-					Slug:     slug,
-				}
-			}
-			return msgFetchedPlaylist{pl}
-
-		case mediaYouTube:
-			pl := playlist{
-				Title:   uri.Title,
-				Entries: make([]playlistEntry, len(uri.Chapters)),
-			}
-			dst := os.TempDir() + "/barbershop_youtube_" + uri.ID
-			for i := range pl.Entries {
-				pl.Entries[i].Title = uri.Chapters[i].Title
-				pl.Entries[i].URI = mediaFile{
-					Path: fmt.Sprintf("%v/%v - %03d %v [%v].wav", dst, pl.Title, i+1, uri.Chapters[i].Title, uri.ID),
-				}
-			}
-			// download, if we haven't already necessary
-			for _, e := range pl.Entries {
-				if _, err := os.Stat(e.URI.(mediaFile).Path); err != nil {
-					dst := os.TempDir() + "/barbershop_youtube_" + uri.ID
-					if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "--split-chapters", "-P", dst, uri.ID); err != nil {
-						return msgError{err}
-					}
-					break
-				}
-			}
-			return msgFetchedPlaylist{pl}
-
-		default:
-			panic(fmt.Sprintf("unhandled mediaURI type: %T", uri))
+func fetchPlaylist(uri mediaURI) (playlist, error) {
+	switch uri := uri.(type) {
+	case mediaFile:
+		pl := playlist{
+			Title: uri.Path,
 		}
-	}
-}
+		files, err := os.ReadDir(uri.Path)
+		if err != nil {
+			return playlist{}, err
+		}
+		for _, file := range files {
+			pl.Entries = append(pl.Entries, playlistEntry{
+				Title: file.Name(),
+				URI: mediaFile{
+					Path: uri.Path + "/" + file.Name(),
+				},
+			})
+		}
+		return pl, nil
 
-func cmdFetchPlaylistTrack(uri mediaURI, track int) tea.Cmd {
-	return func() tea.Msg {
-		r := cmdFetchPlaylist(uri)()
-		pl, ok := r.(msgFetchedPlaylist)
-		if !ok {
-			return r
+	case mediaBandcamp:
+		var bcpl struct {
+			ArtistID string `json:"uploader_id"`
+			Title    string
+			Entries  []struct {
+				Title string
+				URL   string
+			}
 		}
-		if track < 1 || track > len(pl.pl.Entries) {
-			return msgError{errors.New("invalid track number")}
+		url := fmt.Sprintf("https://%v.bandcamp.com/album/%v", uri.ArtistID, uri.Slug)
+		if out, err := execCmd("yt-dlp", "-J", "--flat-playlist", url); err != nil {
+			return playlist{}, err
+		} else if err := json.Unmarshal(out, &bcpl); err != nil {
+			return playlist{}, err
 		}
-		return cmdFetchTrack(pl.pl.Entries[track-1].URI)()
+		pl := playlist{
+			Title:   bcpl.ArtistID + " - " + bcpl.Title, // TODO: fetch a nicer artist name
+			Entries: make([]playlistEntry, len(bcpl.Entries)),
+		}
+		for i := range pl.Entries {
+			_, slug, _ := strings.Cut(bcpl.Entries[i].URL, "track/")
+			pl.Entries[i].Title = bcpl.Entries[i].Title
+			pl.Entries[i].URI = mediaBandcamp{
+				ArtistID: uri.ArtistID,
+				Slug:     slug,
+			}
+		}
+		return pl, nil
+
+	case mediaYouTube:
+		pl := playlist{
+			Title:   uri.Title,
+			Entries: make([]playlistEntry, len(uri.Chapters)),
+		}
+		dst := os.TempDir() + "/barbershop_youtube_" + uri.ID
+		for i := range pl.Entries {
+			pl.Entries[i].Title = uri.Chapters[i].Title
+			pl.Entries[i].URI = mediaFile{
+				Path: fmt.Sprintf("%v/%v - %03d %v [%v].wav", dst, pl.Title, i+1, uri.Chapters[i].Title, uri.ID),
+			}
+		}
+		// download, if we haven't already necessary
+		for _, e := range pl.Entries {
+			if _, err := os.Stat(e.URI.(mediaFile).Path); err != nil {
+				dst := os.TempDir() + "/barbershop_youtube_" + uri.ID
+				if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "--split-chapters", "-P", dst, uri.ID); err != nil {
+					return playlist{}, err
+				}
+				break
+			}
+		}
+		return pl, nil
+
+	default:
+		panic(fmt.Sprintf("unhandled mediaURI type: %T", uri))
 	}
 }

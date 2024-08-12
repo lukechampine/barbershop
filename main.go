@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/http"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"lukechampine.com/flagg"
@@ -14,6 +15,7 @@ var (
 
 Actions:
     id            identify a sample
+    serve         run as a service
 `
 	versionUsage = rootUsage
 	idUsage      = `Usage:
@@ -33,18 +35,24 @@ func main() {
 	idCmd.BoolVar(&bb.silent, "silent", false, "don't play audio")
 	track := idCmd.Int("track", 0, "identify the n-th track of the album")
 	manual := idCmd.Bool("manual", false, "control speed and sample offset manually")
+	srvCmd := flagg.New("serve", "run as a service")
 
 	cmd := flagg.Parse(flagg.Tree{
 		Cmd: rootCmd,
 		Sub: []flagg.Tree{
 			{Cmd: versionCmd},
 			{Cmd: idCmd},
+			{Cmd: srvCmd},
 		},
 	})
 	args := cmd.Args()
 
 	switch cmd {
 	case rootCmd, versionCmd:
+		if len(args) > 0 {
+			cmd.Usage()
+			return
+		}
 		fmt.Println("Barbershop v0.1.0")
 
 	case idCmd:
@@ -71,6 +79,16 @@ func main() {
 		p := tea.NewProgram(m)
 		if _, err := p.Run(); err != nil {
 			log.Fatalln("Error:", err)
+		}
+
+	case srvCmd:
+		srv, err := newServer(".")
+		if err != nil {
+			log.Fatalln("Error:", err)
+		}
+		log.Println("Listening on :8080...")
+		if err := http.ListenAndServe(":8080", srv); err != nil {
+			log.Fatalln(err)
 		}
 	}
 }
