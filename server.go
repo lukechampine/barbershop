@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -22,39 +24,42 @@ var templRoot = template.Must(template.New("root").Parse(`
 	<script src="/static/htmx.min.js"></script>
 	<div id="result">
 		<img class="htmx-indicator" src="/static/bars.svg" style="background-color: coral">
-		<p class="htmx-indicator">Identifying...</p>
+		<p class="htmx-indicator">Queued...</p>
 	</div>
 	<input id="uri" name="uri" type="text" hx-post="/identify" hx-target="#result" hx-indicator="#result">
 	<button>Submit</button>
 </html>
 `))
 
-var templIdentify = template.Must(template.New("identify").Parse(`
-{{ if .Found }}
-	<div>
-		<p>{{ .Artist }} - {{ .Title }}</p>
-		<p>Links: 
-			{{ range $key, $value := .Links }}
-				 <a href="{{ $value }}">{{ $key }}
-			{{ end }}
-		</p>
+var templJob = template.Must(template.New("job").Parse(`
+{{ if ne .State "done" }}
+	<div hx-get="/job/{{ .ID }}" hx-trigger="load delay:1s" hx-swap="outerHTML">
+		<img src="/static/bars.svg" style="background-color: coral">
+		<p>{{ .State }}...</p>
 	</div>
+{{ else if .Error }}
+	<div>Error: {{ .Error }}</div>
 {{ else }}
-	<div>Sample not found :(</div>
+	{{ with .Sample }}
+		{{ if .Found }}
+			<div>
+				<p>{{ .Artist }} - {{ .Title }}</p>
+				<p>Links:
+					{{ range $key, $value := .Links }}
+						<a href="{{ $value }}">{{ $key }}</a>
+					{{ end }}
+				</p>
+			</div>
+		{{ else }}
+			<div>Sample not found :(</div>
+		{{ end }}
+	{{ end}}
 {{ end }}
 `))
 
-func uriKey(uri mediaURI) string {
-	switch uri := uri.(type) {
-	case mediaFile:
-		return "file:///" + uri.Path
-	case mediaBandcamp:
-		return "bandcamp:///" + uri.ArtistID + "/" + uri.Slug
-	case mediaYouTube:
-		return "youtube:///" + uri.ID
-	default:
-		panic("unreachable")
-	}
+func jobID(uri string) string {
+	h := sha256.Sum256([]byte(uri))
+	return fmt.Sprintf("%x", h[:8])
 }
 
 type sampleEntry struct {
@@ -70,26 +75,156 @@ type sampleEntry struct {
 	Links  map[string]string `json:"links,omitempty"`
 }
 
-func identifySample(uri mediaURI) (sampleEntry, error) {
+type identifyJob struct {
+	ID     string      `json:"id"`
+	State  string      `json:"state"`
+	URI    string      `json:"uri"`
+	Sample sampleEntry `json:"sample"`
+	Error  string      `json:"error,omitempty"`
+}
+
+type requestLogLine struct {
+	Start       time.Time `json:"start"`
+	End         time.Time `json:"end"`
+	Error       string    `json:"error,omitempty"`
+	Request     string    `json:"request,omitempty"`
+	URIKnown    bool      `json:"uriKnown,omitempty"`
+	URI         string    `json:"uri,omitempty"`
+	ResolveTime string    `json:"resolveTime,omitempty"`
+	SampleKnown bool      `json:"sampleKnown,omitempty"`
+}
+
+type identifyJobLogLine struct {
+	Start time.Time    `json:"start"`
+	End   time.Time    `json:"end"`
+	Job   *identifyJob `json:"job"`
+}
+
+type logLine struct {
+	Type    string              `json:"type"`
+	Request *requestLogLine     `json:"request,omitempty"`
+	Job     *identifyJobLogLine `json:"job,omitempty"`
+}
+
+type server struct {
+	jobs     map[string]*identifyJob
+	uriCache map[string]mediaURI
+	jobQueue []string
+	log      io.Writer
+	mu       sync.Mutex
+}
+
+func (s *server) handleJob(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
+	s.mu.Lock()
+	j, ok := s.jobs[ps.ByName("id")]
+	s.mu.Unlock()
+	if !ok {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+	if req.Header.Get("Accept") == "application/json" {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		enc.Encode(j)
+	} else {
+		templJob.Execute(w, j)
+	}
+}
+
+func (s *server) handleIdentify(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
+	rll := &requestLogLine{
+		Start:   time.Now(),
+		Request: req.URL.String(),
+		URI:     req.FormValue("uri"),
+	}
+	defer func() {
+		rll.End = time.Now()
+		json.NewEncoder(s.log).Encode(logLine{Type: "request", Request: rll})
+	}()
+
+	jobID := jobID(req.FormValue("uri"))
+	s.mu.Lock()
+	j, ok := s.jobs[jobID]
+	if !ok {
+		j = &identifyJob{
+			ID:    jobID,
+			State: "queued",
+			URI:   req.FormValue("uri"),
+		}
+		s.jobs[j.ID] = j
+		s.jobQueue = append(s.jobQueue, j.ID)
+	}
+	s.mu.Unlock()
+	rll.SampleKnown = j.Sample.Found
+	if req.Header.Get("Accept") == "application/json" {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		enc.Encode(j)
+	} else {
+		templJob.Execute(w, j)
+	}
+}
+
+func (s *server) handleRoot(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
+	templRoot.Execute(w, nil)
+}
+
+func (s *server) doJob(j *identifyJob) {
+	setState := func(state string) {
+		s.mu.Lock()
+		j.State = state
+		s.mu.Unlock()
+	}
+	defer setState("done")
+
+	s.mu.Lock()
+	uri, ok := s.uriCache[j.URI]
+	s.mu.Unlock()
+	if !ok {
+		setState("resolving")
+		var isAlbum bool
+		var err error
+		uri, isAlbum, err = resolveURI(j.URI)
+		if _, ok := uri.(mediaFile); ok {
+			err = errors.New("local files are not supported")
+		} else if isAlbum {
+			err = errors.New("albums are not supported")
+		}
+		if err != nil {
+			j.Error = err.Error()
+			return
+		}
+		s.mu.Lock()
+		s.uriCache[j.URI] = uri
+		s.mu.Unlock()
+	}
+
+	setState("fetching")
 	path, err := fetchTrack(uri)
 	if err != nil {
-		return sampleEntry{}, err
+		j.Error = err.Error()
+		return
 	}
+	setState("identifying")
 	id := newTrackIdentifier(path)
 	for {
 		res, err := identifyPath(path, id.currentParams())
 		if err != nil {
-			return sampleEntry{}, err
-		}
-		if id.handleResult(res) == nil {
+			j.Error = err.Error()
+			return
+		} else if id.handleResult(res) == nil {
 			break
 		}
 	}
 	if id.sample == nil {
-		return sampleEntry{Found: false}, nil
+		j.Sample = sampleEntry{Found: false}
+		return
 	}
+	setState("linking")
 	links, _ := shazam.Links(id.sample.res.AppleID)
-	return sampleEntry{
+	j.Sample = sampleEntry{
 		Found: true,
 		Params: struct {
 			Speed     float64 `json:"speed"`
@@ -103,110 +238,29 @@ func identifySample(uri mediaURI) (sampleEntry, error) {
 		Album:  id.sample.res.Album,
 		Year:   id.sample.res.Year,
 		Links:  links,
-	}, nil
-}
-
-type logLine struct {
-	Start        time.Time    `json:"start"`
-	End          time.Time    `json:"end"`
-	Error        string       `json:"error,omitempty"`
-	Request      string       `json:"request,omitempty"`
-	URIKnown     *bool        `json:"uriKnown,omitempty"`
-	URI          string       `json:"uri,omitempty"`
-	ResolveTime  string       `json:"resolveTime,omitempty"`
-	SampleKnown  *bool        `json:"sampleKnown,omitempty"`
-	Sample       *sampleEntry `json:"sample,omitempty"`
-	IdentifyTime string       `json:"identifyTime,omitempty"`
-}
-
-func (ll *logLine) setErr(err error)                { ll.Error = err.Error() }
-func (ll *logLine) setResolveTime(d time.Duration)  { ll.ResolveTime = d.String() }
-func (ll *logLine) setURI(uri mediaURI)             { ll.URI = uriKey(uri) }
-func (ll *logLine) setURIKnown(known bool)          { ll.URIKnown = &known }
-func (ll *logLine) setSampleKnown(known bool)       { ll.SampleKnown = &known }
-func (ll *logLine) setIdentifyTime(d time.Duration) { ll.IdentifyTime = d.String() }
-func (ll *logLine) setSample(se sampleEntry)        { ll.Sample = &se }
-func (ll *logLine) writeTo(w io.Writer) {
-	ll.End = time.Now()
-	json.NewEncoder(w).Encode(ll)
-}
-
-func newLogLine(req *http.Request) logLine {
-	return logLine{
-		Start:   time.Now(),
-		Request: req.URL.String(),
 	}
 }
 
-type server struct {
-	samples  map[string]sampleEntry
-	uriCache map[string]mediaURI
-	log      io.Writer
-	mu       sync.Mutex
-}
-
-func (s *server) handleIdentify(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
-	ll := newLogLine(req)
-	defer ll.writeTo(s.log)
-
-	reqURI := req.FormValue("uri")
-	s.mu.Lock()
-	uri, ok := s.uriCache[reqURI]
-	s.mu.Unlock()
-	ll.setURIKnown(ok)
-	if !ok {
-		start := time.Now()
-		var isAlbum bool
-		var err error
-		uri, isAlbum, err = resolveURI(reqURI)
-		ll.setResolveTime(time.Since(start))
-		if _, ok := uri.(mediaFile); ok {
-			err = errors.New("local files are not supported")
-		} else if isAlbum {
-			err = errors.New("albums are not supported")
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			ll.setErr(err)
-			return
-		}
-		ll.setURI(uri)
+func (s *server) loopJobs() {
+	for ; ; time.Sleep(time.Second) {
 		s.mu.Lock()
-		s.uriCache[reqURI] = uri
-		s.mu.Unlock()
-	}
-	s.mu.Lock()
-	se, ok := s.samples[uriKey(uri)]
-	s.mu.Unlock()
-	ll.setSampleKnown(ok)
-	if !ok {
-		start := time.Now()
-		var err error
-		se, err = identifySample(uri)
-		ll.setIdentifyTime(time.Since(start))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			ll.setErr(err)
-			return
+		if len(s.jobQueue) == 0 {
+			s.mu.Unlock()
+			continue
 		}
-		ll.setSample(se)
-		s.mu.Lock()
-		s.samples[uriKey(uri)] = se
+		jobID := s.jobQueue[0]
+		s.jobQueue = s.jobQueue[1:]
+		j, ok := s.jobs[jobID]
+		if !ok {
+			panic("unknown job in queue")
+		}
 		s.mu.Unlock()
-	}
 
-	if req.Header.Get("Accept") == "application/json" {
-		w.Header().Set("Content-Type", "application/json")
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		enc.Encode(se)
-	} else {
-		templIdentify.Execute(w, se)
+		start := time.Now()
+		s.doJob(j)
+		ll := logLine{Type: "job", Job: &identifyJobLogLine{Start: start, End: time.Now(), Job: j}}
+		json.NewEncoder(s.log).Encode(ll)
 	}
-}
-
-func (s *server) handleRoot(w http.ResponseWriter, req *http.Request, _ httprouter.Params) {
-	templRoot.Execute(w, nil)
 }
 
 func newServer(dir string) (http.Handler, error) {
@@ -214,7 +268,7 @@ func newServer(dir string) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	samples := make(map[string]sampleEntry)
+	jobs := make(map[string]*identifyJob)
 
 	// scan log lines as json
 	s := bufio.NewScanner(logFile)
@@ -222,8 +276,8 @@ func newServer(dir string) (http.Handler, error) {
 		var ll logLine
 		if err := json.Unmarshal(s.Bytes(), &ll); err != nil {
 			return nil, err
-		} else if ll.Sample != nil {
-			samples[ll.URI] = *ll.Sample
+		} else if ll.Job != nil {
+			jobs[ll.Job.Job.ID] = ll.Job.Job
 		}
 	}
 	if err := s.Err(); err != nil {
@@ -231,13 +285,15 @@ func newServer(dir string) (http.Handler, error) {
 	}
 
 	srv := &server{
-		samples:  samples,
+		jobs:     jobs,
 		uriCache: make(map[string]mediaURI),
 		log:      logFile,
 	}
+	go srv.loopJobs()
 	mux := httprouter.New()
 	mux.GET("/", srv.handleRoot)
 	mux.POST("/identify", srv.handleIdentify)
+	mux.GET("/job/:id", srv.handleJob)
 	mux.GET("/static/*path", func(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 		http.ServeFile(w, req, path.Join("static", ps.ByName("path")))
 	})
