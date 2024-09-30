@@ -25,6 +25,8 @@ func execCmd(prog string, args ...string) ([]byte, error) {
 			return nil, errors.New(prog + " not found")
 		}
 		return nil, errors.New(stderr.String())
+	} else if bytes.Contains(stdout.Bytes(), []byte("File is larger than max-filesize")) {
+		return nil, errors.New("file is too large")
 	}
 	return stdout.Bytes(), nil
 }
@@ -104,7 +106,7 @@ func resolveURI(uri string) (mediaURI, bool, error) {
 	return ytpl, len(ytpl.Chapters) > 0, nil
 }
 
-func fetchTrack(uri mediaURI) (string, error) {
+func fetchTrack(uri mediaURI, maxSize int64) (string, error) {
 	switch uri := uri.(type) {
 	case mediaFile:
 		return uri.Path, nil
@@ -113,7 +115,7 @@ func fetchTrack(uri mediaURI) (string, error) {
 		url := fmt.Sprintf("https://%v.bandcamp.com/track/%v", uri.ArtistID, uri.Slug)
 		if _, err := os.Stat(path); err == nil {
 			return path, nil
-		} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", url); err != nil {
+		} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "--max-filesize", fmt.Sprint(maxSize), "-o", path, "--", url); err != nil {
 			return "", err
 		}
 		return path, nil
@@ -121,7 +123,7 @@ func fetchTrack(uri mediaURI) (string, error) {
 		path := os.TempDir() + "/barbershop_youtube_" + url.PathEscape(uri.Title) + ".wav"
 		if _, err := os.Stat(path); err == nil {
 			return path, nil
-		} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "-o", path, "--", uri.ID); err != nil {
+		} else if _, err := execCmd("yt-dlp", "-x", "--audio-format", "wav", "--max-filesize", fmt.Sprint(maxSize), "-o", path, "--", uri.ID); err != nil {
 			return "", err
 		}
 		return path, nil

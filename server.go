@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -20,35 +21,144 @@ import (
 
 var templRoot = template.Must(template.New("root").Parse(`
 <!DOCTYPE html>
-<html>
-	<script src="/static/htmx.min.js"></script>
-	<div id="result">
-		<img class="htmx-indicator" src="/static/bars.svg" style="background-color: coral">
-		<p class="htmx-indicator">Queued...</p>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="/static/htmx.min.js"></script>
+  <title>Barbershop</title>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.16/dist/tailwind.min.css" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Righteous&family=Roboto:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    body {
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-family: 'Roboto', sans-serif;
+    }
+
+    .card {
+      background-color: white;
+      border-radius: 1rem;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+      padding: 2rem;
+    }
+
+    .title {
+      font-family: 'Righteous', sans-serif;
+      font-weight: bold;
+    }
+
+    .link-container {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .link-container a {
+      display: flex;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+
+    .link-container a img {
+      width: 24px;
+      height: 24px;
+      margin-right: 0.5rem;
+    }
+
+	.link-container iframe {
+	  border-radius: 1em;
+	  padding: 5px;
+	}
+
+    .fade-in {
+      animation: fadeIn 0.3s ease-in-out;
+    }
+
+    @keyframes fadeIn {
+      0% { opacity: 0; }
+      100% { opacity: 1; }
+    }
+
+    .loading:after {
+	  content: '';
+	  animation: ellipsis 1.5s steps(4) infinite;
+	  display: inline-block;
+	  width: 1em;
+	  text-align: left;
+	}
+
+    @keyframes ellipsis {
+	  0% { content: ''; }
+	  25% { content: '.'; }
+	  50% { content: '..'; }
+	  75% { content: '...'; }
+	}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 class="text-4xl font-bold text-gray-800 mb-4 title">Barbershop</h1>
+
+    <form hx-post="/identify" hx-target="#result-container" class="mb-6">
+      <div class="flex items-center border-b border-gray-400 pb-2">
+        <input class="appearance-none bg-transparent border-none w-full text-gray-700 mr-3 py-1 px-2 leading-tight focus:outline-none" type="text" placeholder="YouTube or Bandcamp URL" aria-label="URL" name="uri" required>
+        <button class="flex-shrink-0 bg-blue-500 hover:bg-blue-700 border-blue-500 hover:border-blue-700 text-sm border-4 text-white py-1 px-2 rounded" type="submit">
+          Submit
+        </button>
+      </div>
+    </form>
+
+    <div id="result-container"></div>
+
+	<div class="flex items-center space-x-4">
+		<p>
+			Did you know you can run Barbershop locally?<br>
+			No queue, more features, plus it's got cool ASCII art!
+		</p>
+		<a href="https://github.com/lukechampine/barbershop" target="_" class="inline-flex items-center justify-center p-5 text-base font-medium text-gray-500 rounded-lg bg-gray-50 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-400 dark:bg-gray-800 dark:hover:bg-gray-700 dark:hover:text-white">
+			<img src="https://github.githubassets.com/assets/GitHub-Mark-ea2971cee799.png" width="25px" height="25px">
+			<span class="w-full" style="padding-left:5px; padding-right:5px">Check out the project on GitHub</span>
+			<svg class="w-4 h-4 ms-2 rtl:rotate-180" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 14 10">
+				<path stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M1 5h12m0 0L9 1m4 4L9 9"/>
+			</svg>
+		</a> 
 	</div>
-	<input id="uri" name="uri" type="text" hx-post="/identify" hx-target="#result" hx-indicator="#result">
-	<button>Submit</button>
+  </div>
+</body>
 </html>
 `))
 
-var templJob = template.Must(template.New("job").Parse(`
+var templJob = template.Must(template.New("job").Funcs(template.FuncMap{
+	"embed": func(url string) string {
+		url = strings.Replace(url, "watch?v=", "embed/", 1)
+		url = strings.Replace(url, "open.spotify.com", "embed.spotify.com", 1)
+		return url
+	},
+}).Parse(`
 {{ if ne .State "done" }}
 	<div hx-get="/job/{{ .ID }}" hx-trigger="load delay:1s" hx-swap="outerHTML">
-		<img src="/static/bars.svg" style="background-color: coral">
-		<p>{{ .State }}...</p>
+		<p><span class="loading font-bold">Status: {{ .State }}</span></p>
 	</div>
 {{ else if .Error }}
-	<div>Error: {{ .Error }}</div>
+	<div class="text-red-800 font-bold">Error: {{ .Error }}!</div>
 {{ else }}
 	{{ with .Sample }}
 		{{ if .Found }}
-			<div>
-				<p>{{ .Artist }} - {{ .Title }}</p>
-				<p>Links:
-					{{ range $key, $value := .Links }}
-						<a href="{{ $value }}">{{ $key }}</a>
+			<div class="fade-in">
+				<h2 class="text-lg text-gray-800 mb-2">Original sample: <span class="font-bold">{{ .Artist }} — {{ .Title }}</span></h2>
+				<div class="link-container">
+					{{ with (index .Links "YouTube") }}
+						<iframe src="{{ embed . }}" height="400px"></iframe>
 					{{ end }}
-				</p>
+					{{ with (index .Links "Spotify") }}
+						<iframe src="{{ embed . }}" height="100px"></iframe>
+					{{ end }}
+				</div>
 			</div>
 		{{ else }}
 			<div>Sample not found :(</div>
@@ -190,7 +300,7 @@ func (s *server) doJob(j *identifyJob) {
 		if _, ok := uri.(mediaFile); ok {
 			err = errors.New("local files are not supported")
 		} else if isAlbum {
-			err = errors.New("albums are not supported")
+			err = errors.New("albums are not supported in the web UI")
 		}
 		if err != nil {
 			j.Error = err.Error()
@@ -202,7 +312,7 @@ func (s *server) doJob(j *identifyJob) {
 	}
 
 	setState("fetching")
-	path, err := fetchTrack(uri)
+	path, err := fetchTrack(uri, 10*(1<<20)) // 10 MiB
 	if err != nil {
 		j.Error = err.Error()
 		return

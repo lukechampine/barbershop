@@ -49,7 +49,7 @@ func renderRatio(ratio float64) string {
 
 func cmdFetchTrack(uri mediaURI) tea.Cmd {
 	return func() tea.Msg {
-		path, err := fetchTrack(uri)
+		path, err := fetchTrack(uri, 10e9)
 		if err != nil {
 			return msgError{err}
 		}

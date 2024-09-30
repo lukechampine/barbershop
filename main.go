@@ -36,6 +36,7 @@ func main() {
 	track := idCmd.Int("track", 0, "identify the n-th track of the album")
 	manual := idCmd.Bool("manual", false, "control speed and sample offset manually")
 	srvCmd := flagg.New("serve", "run as a service")
+	srvAddr := srvCmd.String("addr", ":8070", "address to serve on")
 
 	cmd := flagg.Parse(flagg.Tree{
 		Cmd: rootCmd,
@@ -86,8 +87,8 @@ func main() {
 		if err != nil {
 			log.Fatalln("Error:", err)
 		}
-		log.Println("Listening on :8080...")
-		if err := http.ListenAndServe(":8080", srv); err != nil {
+		log.Println("Listening on", *srvAddr)
+		if err := http.ListenAndServe(*srvAddr, srv); err != nil {
 			log.Fatalln(err)
 		}
 	}
